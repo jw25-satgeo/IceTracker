@@ -2,6 +2,7 @@ import os, pathlib, shutil
 import numpy as np
 import scipy
 
+import datetime
 import pandas as pd
 import xml.etree.ElementTree as ET
 
@@ -29,7 +30,7 @@ def download(buoy_data, data_dir='data', delta=86400 * 10, offset = 86400*0.1, c
         scroller.search(delta=delta, offset=offset)
         scroller.download_results(cache_dir=buoy_path,cred_user=cred_user,cred_pass=cred_pass)
 
-def process_downloads(buoy_data, data_dir='data', idate=3):
+def process_downloads(buoy_data, data_dir='data', idate=3, window=(1024, 128)):
     '''
     sort sentinel-1 file format {data_dir}/{BUOY_ID}/S1_capID_swath_datetime_... into
     {data_dir}/{BUOY_ID}/{DATETIME}/... format
@@ -37,54 +38,70 @@ def process_downloads(buoy_data, data_dir='data', idate=3):
     buoy_ids = set(buoy_data.BuoyID)
     for buoy_id in buoy_ids:
         buoy_path = data_dir+'/'+str(buoy_id)
-        fnl = [el for el in os.listdir(buoy_path) if len(el.split('.'))==2]
-        dtl = list(set([el.split('_')[idate] for el in fnl]))
+        fnl = [el for el in os.listdir(buoy_path) if len(el.split('.'))==2] # exclude directories
+        dtl = list(set([el.split('_')[idate] for el in fnl])) + [el for el in os.listdir(buoy_path) if len(el.split('.'))==1]
         for dtn in dtl:
             dtn_path = buoy_path + '/' + str(dtn)
             if not os.path.exists(dtn_path): os.mkdir(dtn_path)
-            [os.rename(buoy_path+'/'+fn, dtn_path+'/'+"_".join(fn.split('_')[4:])) for fn in fnl if dtn in fn]
-            merge_gdal(dtn_path)
-            parse_date(buoy_data
-            
+            #[os.rename(buoy_path+'/'+fn, dtn_path+'/'+"_".join(fn.split('_')[4:])) for fn in fnl if dtn in fn]
+            [os.rename(os.path.join(buoy_path,fn), os.path.join(dtn_path,fn)) for fn in fnl if dtn in fn]
+            merge_gdal(dtn_path, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'])
+            crop_target(os.path.join(dtn_path,'src.tiff'), buoy_data[buoy_data.BuoyID==buoy_id], window)            
             
 def merge_gdal(merge_dir, fn_o='src.tiff', master_tags=['HH','HV','VH','VV']):
     '''merge all .tiff in {merge_dir} into {merge_dir}/src.tiff
-    note : master_tags entries are length-2 strings at start of target filename.
+    note : master_tags is a list of strings to be located between underscores.
     note2: master files must have an associated .xml file to be recognized as such.'''
-    fn_i = [el for el in os.listdir(merge_dir) if el.split('.')[-1]=='tiff']
-    imaster = [i for i in range(len(fn_i)) if fn_i[i][:2] in master_tags and os.path.exists(os.path.join(merge_dir,os.path.splitext(fn_i[i])[0]+'.xml'))][0]
+    fn_i = [el for el in os.listdir(merge_dir) if os.path.splitext(el)[1]=='.tiff']
+    imaster = [
+        i for i in range(len(fn_i))
+        if bool(set(fn_i[i].split('_')) & set(master_tags)) # any2any match
+        and os.path.exists(os.path.join(merge_dir,os.path.splitext(fn_i[i])[0]+'.xml'))
+    ][0]
     # - copy master metadata to src.tiff
+    gdal.UseExceptions()
     ds_i = gdal.Open(os.path.join(merge_dir,fn_i[imaster]))
-    iw, ih, irdt, isrs, igtf = ds_i.RasterXSize, ds_i.RasterYSize, ds_i.GetRasterBand(1).DataType, ds_i.GetProjection(), ds_i.GetGeoTransform()
-    ds_o = gdal.GetDriverByName("GTiff").Create(os.path.join(merge_dir,fn_o), iw, ih, 1, irdt)
-    ds_o.SetProjection(isrs)
-    ds_o.SetGeoTransform(igtf)
-    
+    iw,ih,irdt,isrs,icmp = ds_i.RasterXSize,ds_i.RasterYSize,ds_i.GetRasterBand(1).DataType,ds_i.GetGCPProjection(),ds_i.GetMetadata('IMAGE_STRUCTURE')
+    ds_o = gdal.GetDriverByName("MEM").Create('', iw, ih, 1, irdt)
+    ds_o.SetGCPs(ds_i.GetGCPs(), isrs)
     band_idx = 1
     for i in range(len(fn_i)):
         ds_i = gdal.Open(os.path.join(merge_dir, fn_i[i]))
-        if (i != imaster): ds_i = gdal.Warp('',ds_i,format="MEM",width=iw, height=ih, dstSRS=isrs, dstGeoTransform=igtf, resampleAlg='nearest')
+        if (i != imaster): ds_i = gdal.Warp('',ds_i,format="MEM",width=iw, height=ih, dstSRS=isrs, resampleAlg='nearest', tps=True)
         for j in range(1, ds_i.RasterCount + 1):
             if (band_idx > 1) : ds_o.AddBand(irdt)
             ds_o.GetRasterBand(band_idx).WriteArray(ds_i.GetRasterBand(j).ReadAsArray())
             band_idx += 1
-    
-    shutil.copy( # -- copy .xml file from master .tiff
-        os.path.join(merge_dir, os.path.splitext(fn_i[imaster])[0]+'xml'),
-        os.path.join(merge_dir, os.path.splitext(fn_o)[0]+'.xml'))
-    )
-    ds_i = None
-    ds_o = None
 
-def parse_date(src_fn, buoy_data, datestring, window=(1024,128)):
-    '''identifies position of buoys with least time delta and creates slice 'tgt_{window}.tiff''''
+    #gdal.GetDriverByName('GTiff').CreateCopy(os.path.join(merge_dir,fn_o_p), ds_o)
+    gdal.Translate(os.path.join(merge_dir, fn_o), ds_o, format='GTiff', creationOptions=[f"{k}={v}" for k,v in icmp.items() if v is not None])
+    ds_i, ds_o = None, None
+
+    # - copy master metadata to src.xml, removing irrelevant swaths
+    tree = ET.parse(os.path.join(merge_dir, os.path.splitext(fn_i[imaster])[0]+'.xml'))
+    meta = tree.getroot().find('metadata')
+    token_l = fn_i[imaster].split('_')
+    i = 0
+    while i < len(meta.findall('product')):
+        tmp = meta.findall('product')[i]
+        swath, polar = tmp.find('swath').text, tmp.find('polarisation').text
+        if not (swath in token_l and polar in token_l):
+            meta.remove(meta.findall('product')[i])
+            meta.remove(meta.findall('noise')[i])
+            meta.remove(meta.findall('calibration')[i])
+        else : i += 1
+    tree.write(os.path.join(merge_dir, os.path.splitext(fn_o)[0]+'.xml'))
+    tree = None
+
+def crop_target(src_fn, buoy_data, window=(1024,128)):
+    '''identifies position of buoys with least time delta and creates slice 'tgt_{window}.tiff' '''
+    gdal.UseExceptions()
     gdal_data = gdal.Open(src_fn)
-    
-    burst_idx = int([el for el in path.split('/')[-1].split('_') if len(el)==3 and el[:2]=='IW'][0][-1]) - 1
-    grid = ET.parse(path + '.xml').getroot().find('metadata').findall('product')[burst_idx]
-    grid = grid.find('content').find('geolocationGrid').find('geolocationGridPointList')
-    meta_gcps = pd.DataFrame([{e.tag : e.text for e in el} for el in grid])
-    slc_dt = datetime.datetime.strptime(meta_gcps['azimuthTime'].iloc[0], '%Y-%m-%dT%H:%M:%S.%f')
+
+    # assumes only 1 swath in metadata
+    xml_fn = os.path.splitext(src_fn)[0] + '.xml'
+    grid = ET.parse(xml_fn).getroot().find('metadata').find('product').find('content').find('geolocationGrid').find('geolocationGridPointList')
+    slc_dt = datetime.datetime.strptime(pd.DataFrame([{e.tag : e.text for e in el} for el in grid])['azimuthTime'].iloc[0], '%Y-%m-%dT%H:%M:%S.%f')
     
     buoy_data['dt'] = buoy_data.apply(lambda x: datetime.datetime(int(x['Year']), int(x['Month']), int(x['Day']),
                                                             int(x['Hour']), int(x['Minute']), int(x['Second'])), axis=1)

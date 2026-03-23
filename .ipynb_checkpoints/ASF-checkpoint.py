@@ -5,6 +5,7 @@ import concurrent.futures
 import pickle
 
 import asf_search
+from asf_search.download.file_download_type import FileDownloadType
 
 def wrap_360m180(x):
     if (x > 180):
@@ -40,8 +41,8 @@ class BuoyScroller:
     def from_cache(self, file_name):
         with open(file_name, mode='rb') as f:
             return pickle.load(f)
-
-    def download_results(self, cache_dir=None, cred_user=None, cred_pass=None, max_workers=10):
+    
+    def download_results(self, cache_dir=None, cred_user=None, cred_pass=None, max_workers=10, fileType=FileDownloadType.ALL_FILES):
         if (cache_dir is None): cache_dir = f'{self.label}_downloads'
         pathlib.Path(cache_dir).mkdir(exist_ok=True)
 
@@ -50,15 +51,40 @@ class BuoyScroller:
             cred_pass = getpass.getpass('Password:')
             
         session = asf_search.ASFSession().auth_with_creds(cred_user, cred_pass)
+        rate_limiter = RateLimiter(rate_per_sec=4.0)
         
         asf_results = list(itertools.chain.from_iterable(self.results.values()))
-
+        
+        downloader = self.single_download
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(result.download, path=cache_dir, session=session) for result in asf_results]
+            futures = [executor.submit(downloader,
+                product=result,
+                path=cache_dir,
+                session=session,
+                fileType=fileType,
+                limiter=rate_limiter
+            ) for result in asf_results]
             for future in concurrent.futures.as_completed(futures):
                 _ = future.result()
+                
+    def single_download(self, product, path, session, limiter, fileType):
+        for url in product.get_urls(fileType):
+            filename = product.properties['fileID'] + '.' + url.split('.')[-1]
+            if (pathlib.Path(path+'/'+filename).exists()):
+                print(f'{filename} already exists - skipping download.')
+                return
+            for i in range(self.query_retries):
+                limiter.acquire()
+                try:
+                    asf_search.download.download_url(url, path=path, filename=filename, session=session)
+                    break
+                except Exception as e:
+                    print(f"Error on {filename}:{e} \n ... retrying {self.query_retries - i} more times.")
+                    single_results = None
+                    time.sleep((2 ** i) + random.random())
     
-    def search(self, delta=86400, max_results=10, dataset=asf_search.constants.DATASET.SLC_BURST, polarization=None):
+    def search(self, delta=86400, offset=43200, max_results=10, dataset=asf_search.constants.DATASET.SLC_BURST, polarization=None):
         
         # set temporal density 
         access_dates = []
@@ -81,7 +107,7 @@ class BuoyScroller:
                 polarization,
                 wkt,
                 date,
-                date + datetime.timedelta(seconds=delta),
+                date + datetime.timedelta(seconds=offset),
                 max_results
             ) for date, wkt in tasks]
             for future in concurrent.futures.as_completed(futures):

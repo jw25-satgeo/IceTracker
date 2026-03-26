@@ -1,0 +1,143 @@
+
+    #pc1 = np.stack((pc1[:y1-y0, :x1-x0], pc2[:y1-y0, :x1-x0]),axis=0)
+    # src_arr_v = src_arr
+    #p_l, p_h = np.floor(p_coords.min(axis=(1,2))), np.ceil(p_coords.max(axis=(1,2))) + 1; p_coords -= p_l[:,None,None] + 1
+    #p_l, p_h = np.maximum(p_l,0).astype(int), np.minimum(p_h, src_arr.shape).astype(int); src_arr_v = src_arr[p_l[0]:p_h[0], p_l[1]:p_h[1]]
+    #dst_arr[y0:y1,x0:x1] = scipy.ndimage.map_coordinates(src_arr_v.real,p_coords,order=0) + 1j * scipy.ndimage.map_coordinates(src_arr_v.imag,p_coords,order=0)
+    #dst_arr[y0:y1,x0:x1] = scipy.ndimage.map_coordinates(src_arr.real,pc1,order=0) + 1j * scipy.ndimage.map_coordinates(src_arr.imag,pc1,order=0)
+    
+    #pc1, pc2 = np.rint(pc1).astype(int), np.rint(pc2).astype(int)
+    #mask = ~((pc1 >= 0) * (pc1 < src_arr.shape[0]) * (pc2 >= 0) * (pc2 < src_arr.shape[1])).astype(bool)
+    #pc1[mask] = 0; pc2[mask] = 0;
+    #pc = src_arr[pc1, pc2]; pc[mask] = 0
+    #dst_arr[y0:y1,x0:x1] = pc
+    
+    #p_coords = np.rint(p_coords).astype(int)
+    #mask = ((p_coords >= np.zeros((1,1,1))) + (p_coords < np.array(src_arr.shape)[:,None,None])).astype(bool)
+    #p_coords[mask] = 0
+    #dst_arr[y0:y1,x0:x1] = src_arr[p_coords[0], p_coords[1]]
+    #dst_arr[y0:y1,x0:x1][mask] = 0
+
+
+
+# ---- raster registration & stacking
+
+def merge_gdal(merge_dir, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'], stride=(12,4), batch_factor=16, max_workers=None):
+    '''merge all .tiff in {merge_dir} into {merge_dir}/src.tiff
+    note : master_tags is a list of strings to be located between underscores.
+    note2: master files must have an associated .xml file to be recognized as such.'''
+    fn_i = [el for el in os.listdir(merge_dir) if os.path.splitext(el)[1]=='.tiff']
+    imaster = [
+        i for i in range(len(fn_i))
+        if bool(set(fn_i[i].split('_')) & set(master_tags)) # any2any match
+        and os.path.exists(os.path.join(merge_dir,os.path.splitext(fn_i[i])[0]+'.xml'))
+    ][0]
+    # - copy master metadata to src.tiff
+    gdal.UseExceptions()
+    ds_i = gdal.Open(os.path.join(merge_dir,fn_i[imaster]))
+    iw,ih,irdt,icmp = ds_i.RasterXSize,ds_i.RasterYSize,ds_i.GetRasterBand(1).DataType,ds_i.GetMetadata('IMAGE_STRUCTURE')
+    ds_o = gdal.GetDriverByName("MEM").Create('', iw, ih, 1, irdt)
+    ds_o.SetGCPs(ds_i.GetGCPs(), ds_i.GetGCPProjection())
+    # - transfer all bands from source .tiffs to src.tiff
+    f1 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY, e.GCPZ/10000) for e in ds_o.GetGCPs()]) # scale Z by 1/10000 for more lat/lon sensitivity
+    f1 = scipy.interpolate.RBFInterpolator(f1[:,:2], f1[:,2:]) # line 2 geo
+    #f1 = scipy.interpolate.LinearNDInterpolator(f1[:,:2], f1[:,2:])
+    f1_coords = np.stack(np.meshgrid(np.arange(0,ih+stride[0],stride[0]), np.arange(0,iw+stride[1],stride[1]), indexing='ij'),axis=-1)
+    map_shape = f1_coords.shape
+    f1_coords = f1(f1_coords.reshape((np.prod(map_shape[:-1]), map_shape[-1]))) #N,ngeoparams
+    band_idx = 1
+    for i in range(len(fn_i)):
+        ds_i = gdal.Open(os.path.join(merge_dir, fn_i[i]))
+        f2 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY, e.GCPZ/10000) for e in ds_i.GetGCPs()])
+        f2 = scipy.interpolate.RBFInterpolator(f2[:,2:], f2[:,:2]) # geo 2 line
+        #f2 = scipy.interpolate.LinearNDInterpolator(f2[:,2:], f2[:,:2])
+        f2_coords = np.moveaxis(f2(f1_coords).reshape(map_shape), -1, 0) #map_coordinates assumes axis=0 stacking of coordinate arrays
+        #f2_coords -= 0.5 # GCP pixel center to array index
+        for j in range(1, ds_i.RasterCount + 1):
+            if (band_idx > 1) : ds_o.AddBand(irdt)
+            rst_arr = ds_i.GetRasterBand(j).ReadAsArray()
+            if (i == imaster): ds_o.GetRasterBand(band_idx).WriteArray(rst_arr); band_idx +=1; continue
+            o_arr = np.zeros((ih, iw), dtype=rst_arr.dtype)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [] #  parallel workers for raster transformation
+                for pi in range(0,f2_coords.shape[1]+batch_factor,batch_factor):
+                    for pj in range(0,f2_coords.shape[2]+batch_factor,batch_factor):
+                        futures.append(executor.submit(_batched_coord_warp, src_arr=rst_arr, dst_arr=o_arr,
+                                  pi=pi, pj=pj, stride=stride, coords=f2_coords, batch_factor=batch_factor))
+                [future.result() for future in concurrent.futures.as_completed(futures)]
+            ds_o.GetRasterBand(band_idx).WriteArray(o_arr)
+            band_idx += 1
+
+    #gdal.GetDriverByName('GTiff').CreateCopy(os.path.join(merge_dir,fn_o_p), ds_o)
+    gdal.Translate(os.path.join(merge_dir, fn_o), ds_o, format='GTiff', creationOptions=[f"{k}={v}" for k,v in icmp.items() if v is not None])
+    ds_i, ds_o = None, None
+
+    # - copy master metadata to src.xml, removing irrelevant swaths
+    tree = ET.parse(os.path.join(merge_dir, os.path.splitext(fn_i[imaster])[0]+'.xml'))
+    meta = tree.getroot().find('metadata')
+    token_l = fn_i[imaster].split('_')
+    i = 0
+    while i < len(meta.findall('product')):
+        tmp = meta.findall('product')[i]
+        swath, polar = tmp.find('swath').text, tmp.find('polarisation').text
+        if not (swath in token_l and polar in token_l):
+            meta.remove(meta.findall('product')[i])
+            meta.remove(meta.findall('noise')[i])
+            meta.remove(meta.findall('calibration')[i])
+        else : i += 1
+    tree.write(os.path.join(merge_dir, os.path.splitext(fn_o)[0]+'.xml'))
+    tree = None
+
+def _batched_coord_warp(src_arr, dst_arr, pi, pj, coords, stride, batch_factor):
+    y0, x0 = pi * stride[0], pj * stride[1]
+    if (y0 >= dst_arr.shape[0] or x0 >= dst_arr.shape[1]): return
+    p_coords = scipy.ndimage.zoom(coords[:, pi:pi+batch_factor, pj:pj+batch_factor], [1]+list(stride), order=1)
+    y1 = min(y0 + p_coords.shape[1], dst_arr.shape[0])
+    x1 = min(x0 + p_coords.shape[2], dst_arr.shape[1])
+    p_coords = p_coords[:, :y1-y0, :x1-x0]
+    # src_arr_v = src_arr
+    #p_l, p_h = np.floor(p_coords.min(axis=(1,2))), np.ceil(p_coords.max(axis=(1,2))) + 1; p_coords -= p_l[:,None,None] + 1
+    #p_l, p_h = np.maximum(p_l,0).astype(int), np.minimum(p_h, src_arr.shape).astype(int); src_arr_v = src_arr[p_l[0]:p_h[0], p_l[1]:p_h[1]]
+    #dst_arr[y0:y1,x0:x1] = scipy.ndimage.map_coordinates(src_arr_v.real,p_coords,order=0) + 1j * scipy.ndimage.map_coordinates(src_arr_v.imag,p_coords,order=0)
+    p_coords = np.rint(p_coords).astype(int)
+    dst_arr[y0:y1,x0:x1] = src_arr[p_coords[0], p_coords[1]]
+
+
+
+
+
+
+
+
+
+
+
+
+import xml.etree.ElementTree as ET
+from osgeo import gdal
+import numpy as np
+
+#src_path = f'{scroller.label}_downloads'
+src_path = '300234066312080_BuoyScroller_downloads'
+for burst_path in set([src_path + el.split('.')[0] for el in os.listdir(src_path)]):
+    gdal_data = gdal.Open(burst_path + '.tiff')
+    
+    data = gdal_data.GetRasterBand(1).ReadAsArray()
+    gdal_gcps = pd.DataFrame([{'line':gcp.GCPLine, 'pixel':gcp.GCPPixel,
+                               'longitude':gcp.GCPX, 'latitude':gcp.GCPY,
+                               'height':gcp.GCPZ} for gcp in tmp.GetGCPs()])
+    
+    burst_idx = int([el for el in burst_path.split('/')[-1].split('_') if len(el)==3 and el[:2]=='IW'][0][-1]) - 1
+    grid = ET.parse(path + '.xml').getroot().find('metadata').findall('product')[burst_idx].find('content').find('geolocationGrid').find('geolocationGridPointList')
+    meta_gcps = pd.DataFrame([{e.tag : e.text for e in el} for el in grid])
+
+-- --
+
+resprop_l = [el.properties for el in itertools.chain.from_iterable(scroller.results.values())]
+
+SLC_dict = {}
+for resprop in resprop_l:
+    entry = SLC_dict.setdefault(resprop['groupID'], {}).setdefault(resprop['burst']['subswath'], {}).setdefault(resprop['polarization'],{}).setdefault(resprop['burst']['burstIndex'], {})
+    entry['DATA'] = scroller.label + '_downloads/' + resprop['fileID'] + '.tiff'
+    entry['METADATA'] = scroller.label + '_downloads/' + resprop['fileID'] + '.xml'
+SLC_dicts = [{key:val} for key, val in SLC_dict.items()]

@@ -1,0 +1,113 @@
+# get original @ https://github.com/ASFHyP3/burst2safe/tree/develop
+
+
+# okay maybe dont cannibalize this fully, just call smol function
+
+from pathlib import Path
+
+from asf_search.Products.S1BurstProduct import S1BurstProduct
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import json
+import logging
+from argparse import Namespace
+
+def prod2burst(product):
+    info = create_burst_info(product)
+
+    info.add_shape_info()
+    info.add_start_stop_utc()
+
+    safe = Safe(burst_info, all_anns, work_dir)
+    safe_path = safe.create_safe()
+
+    return safe_path
+
+
+@dataclass
+class BurstInfo:
+    """Dataclass for storing burst information."""
+
+    granule: str | None
+    slc_granule: str | None
+    swath: str
+    polarization: str
+    burst_id: int | None
+    burst_index: int
+    direction: str
+    absolute_orbit: int
+    relative_orbit: int
+    date: datetime | None
+    data_url: str | None
+    data_path: Path | None
+    metadata_url: str | None
+    metadata_path: Path
+    start_utc: datetime | None = None
+    stop_utc: datetime | None = None
+    length: int | None = None
+    width: int | None = None
+
+    def add_shape_info(self):
+        """Add shape information to the BurstInfo object."""
+        annotation = get_subxml_from_metadata(self.metadata_path, 'product', self.swath, self.polarization)
+        self.length = int(annotation.find('swathTiming/linesPerBurst').text)  # type: ignore[arg-type]
+        self.width = int(annotation.find('swathTiming/samplesPerBurst').text)  # type: ignore[arg-type]
+
+    def add_start_stop_utc(self):
+        """Add start and stop UTC to burst info.
+        There is spatial overlap between bursts, so burst start/stop times will overlap as well.
+        """
+        annotation = get_subxml_from_metadata(self.metadata_path, 'product', self.swath, self.polarization)
+        start_utcs = [datetime.fromisoformat(x.find('azimuthTime').text) for x in annotation.findall('.//burst')]  # type: ignore[arg-type]
+        self.start_utc = start_utcs[self.burst_index]
+
+        azimuth_time_interval = float(annotation.find('.//azimuthTimeInterval').text)  # type: ignore[arg-type]
+        assert self.length is not None
+        burst_time_interval = timedelta(seconds=(self.length - 1) * azimuth_time_interval)
+        self.stop_utc = self.start_utc + burst_time_interval
+
+def create_burst_info(product: S1BurstProduct, work_dir: Path) -> BurstInfo:
+    """Create a BurstInfo object given a granule.
+
+    Args:
+        product: A S1BurstProduct object
+        work_dir: The directory to save the data to.
+    """
+    slc_granule = product.umm['InputGranules'][0].split('-')[0]
+
+    burst_granule = product.properties['fileID']
+    direction = product.properties['flightDirection'].upper()
+    polarization = product.properties['polarization'].upper()
+    absolute_orbit = int(product.properties['orbit'])
+    relative_orbit = int(product.properties['pathNumber'])
+    data_url = product.properties['url']
+    metadata_url = product.properties['additionalUrls'][0]
+
+    swath = product.properties['burst']['subswath'].upper()
+    burst_id = int(product.properties['burst']['relativeBurstID'])
+    burst_index = int(product.properties['burst']['burstIndex'])
+
+    date_format = '%Y%m%dT%H%M%S'
+    burst_time_str = burst_granule.split('_')[3]
+    burst_time = datetime.strptime(burst_time_str, date_format)
+    data_path = work_dir / f'{burst_granule}.tiff'
+    metadata_path = work_dir / f'{slc_granule}_{polarization}.xml'
+
+    burst_info = BurstInfo(
+        burst_granule,
+        slc_granule,
+        swath,
+        polarization,
+        burst_id,
+        burst_index,
+        direction,
+        absolute_orbit,
+        relative_orbit,
+        burst_time,
+        data_url,
+        data_path,
+        metadata_url,
+        metadata_path,
+    )
+    return burst_info

@@ -1,6 +1,8 @@
 import datetime, time, calendar
-import pathlib, itertools, random, threading, getpass
+import pathlib, itertools, random, threading, getpass, warnings
 import concurrent.futures
+
+import numpy as np
 
 import pickle
 
@@ -11,25 +13,8 @@ def wrap_360m180(x):
     if (x > 180):
         return x - 360
     return x
-    
-class BuoyScroller:
-    
-    def __init__(self, buoy_id, buoy_data, query_retries=5):
-        self.query_retries = query_retries
 
-        self.label = f'{buoy_id}_BuoyScroller'
-
-        buoy_datax = buoy_data[buoy_data['BuoyID']==buoy_id]
-        
-        # extract time & position
-        self.dates = list(buoy_datax.apply(lambda x: datetime.datetime(int(x['Year']), int(x['Month']), int(x['Day']),
-                                                                      int(x['Hour']), int(x['Minute']), int(x['Second'])), axis=1))
-        self.wktgeos = buoy_datax.apply(lambda x: f"POINT({float(wrap_360m180(x['Lon']))} {float(x['Lat'])})", axis=1)
-        self.wktgeos.index = self.dates
-        self.wktgeos = dict(self.wktgeos)
-        
-        # initialize result list
-        self.results = {}
+class BaseScroller:
 
     def save_cache(self, fn=None):
         if (fn is None):
@@ -52,11 +37,8 @@ class BuoyScroller:
             
         session = asf_search.ASFSession().auth_with_creds(cred_user, cred_pass)
         rate_limiter = RateLimiter(rate_per_sec=4.0)
-        
         asf_results = list(itertools.chain.from_iterable(self.results.values()))
-        
         downloader = self.single_download
-        
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(downloader,
                 product=result,
@@ -67,7 +49,7 @@ class BuoyScroller:
             ) for result in asf_results]
             for future in concurrent.futures.as_completed(futures):
                 _ = future.result()
-                
+        
     def single_download(self, product, path, session, limiter, fileType):
         for url in product.get_urls(fileType):
             filename = product.properties['fileID'] + '.' + url.split('.')[-1]
@@ -83,42 +65,10 @@ class BuoyScroller:
                     print(f"Error on {filename}:{e} \n ... retrying {self.query_retries - i} more times.")
                     single_results = None
                     time.sleep((2 ** i) + random.random())
-    
-    def search(self, delta=86400, offset=43200, max_results=10, dataset=asf_search.constants.DATASET.SLC_BURST, polarization=None):
         
-        # set temporal density 
-        access_dates = []
-        for date in self.dates:
-            if (len(access_dates) > 0 and access_dates[-1] + datetime.timedelta(seconds=delta) > date):
-                continue
-            access_dates.append(date)
-        
-        #BEGIN SEARCH QUERIES
-        self.results = {}
-        rate_limiter = RateLimiter(rate_per_sec=4.0)
-
-        # day-by-day search
-        tasks = [(date, self.wktgeos[date]) for date in access_dates]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(
-                self.single_search_geo,
-                rate_limiter,
-                dataset,
-                polarization,
-                wkt,
-                date,
-                date + datetime.timedelta(seconds=offset),
-                max_results
-            ) for date, wkt in tasks]
-            for future in concurrent.futures.as_completed(futures):
-                date_int, result = future.result()
-                if (len(result) > 0):
-                    print(f'{len(result)} results found!')
-                    self.results.setdefault(date_int, []).extend(result)
-
-    
     def single_search_geo(self, limiter, dataset, polarization, wkt, start_dt, end_dt, max_results=10):
-        print("Querying:", start_dt, wkt)
+        ellipsis = "...)" if len(wkt) > 30 else ""
+        print("Querying:", start_dt, wkt[:30]+ellipsis)
         single_results = None
         for i in range(self.query_retries):
             limiter.acquire()
@@ -139,6 +89,78 @@ class BuoyScroller:
             single_results = []
         return int(start_dt.strftime('%Y%m%d%H%M%S')), single_results
 
+
+
+class BuoyScroller(BaseScroller):
+    
+    def __init__(self, buoy_id, buoy_data, query_retries=5, proximity_thresh=0.000001):
+        self.query_retries = query_retries
+        self.label = f'{buoy_id}_BuoyScroller'
+        
+        # extract time & position
+        buoy_datax = buoy_data[buoy_data['BuoyID']==buoy_id]
+        self.dates = list(buoy_datax.apply(lambda x: datetime.datetime(int(x['Year']), int(x['Month']), int(x['Day']),
+                                                                      int(x['Hour']), int(x['Minute']), int(x['Second'])), axis=1))
+        #proximity_thresh = 0.0004 * 1.05
+        
+        dtlls = buoy_datax.apply(lambda x: np.array((float(wrap_360m180(x['Lon'])), float(x['Lat']))), axis=1) #(float, float) length 2 array
+        dtlls.index = self.dates; dtlls = dict(dtlls)
+        dtll2s, last = {}, None
+        for k, v in dtlls.items():
+            if last is None or ((dtll2s[last] - dtlls[k])**2).sum() > proximity_thresh**2:
+                dtll2s[k] = tuple(v);  last = k
+        self.dtlls = dtll2s
+        self.dates = list(dtll2s.keys())
+                
+        # initialize result list
+        self.results = {}
+
+    def search(self, delta=86400, offset=43200, max_results=10, dataset=asf_search.constants.DATASET.SLC_BURST, polarization=None):
+        
+        warnings.filterwarnings('ignore', module='asf_search')
+        
+        # temporal batching 
+        key, wktgeos, access_dates = None, {}, {}
+        for date in self.dtlls.keys():
+            if (key is None or key + datetime.timedelta(seconds=delta) <= date):
+                key, wktgeos[key], access_dates[key] = date, [], []
+            access_dates[key].append(date)
+            wktgeos[key].append(self.dtlls[date])
+
+        wktgeos = {k:list(dict.fromkeys(v)) for k, v in wktgeos.items()}
+        wktgeos = {k:f'LINESTRING({", ".join([f'{v1[0]} {v1[1]}' for v1 in v])})' for k, v in wktgeos.items()}
+        
+        #BEGIN SEARCH QUERIES
+        self.results = {}
+        rate_limiter = RateLimiter(rate_per_sec=4.0)
+        tasks = [(d1, d2[-1], wktgeos[d1]) for d1, d2 in access_dates.items()]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(
+                self.single_search_geo,
+                rate_limiter,
+                dataset,
+                polarization,
+                wkt,
+                d1,
+                df,
+                max_results
+            ) for d1, df, wkt in tasks]
+            for future in concurrent.futures.as_completed(futures):
+                date_int, result = future.result()
+                lindates = access_dates[datetime.datetime.strptime(str(date_int), '%Y%m%d%H%M%S')]
+                result = [
+                    res for res in result if
+                    min( abs((datetime.datetime.strptime(
+                        res.properties['startTime'],
+                        '%Y-%m-%dT%H:%M:%SZ') - lindate).total_seconds())
+                         for lindate in lindates
+                    ) <= offset
+                ]
+                if (len(result) > 0):
+                    print(f'{len(result)} results found!')
+                    self.results.setdefault(date_int, []).extend(result)
+        
+        warnings.filterwarnings("default", module='asf_search')
 
 class RateLimiter:
     def __init__(self, rate_per_sec, capacity=None):
@@ -163,3 +185,5 @@ class RateLimiter:
 
             # no token available: sleep a bit and retry
             time.sleep(1.0 / self.rate)
+
+

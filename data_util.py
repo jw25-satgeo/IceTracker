@@ -1,4 +1,4 @@
-import os, pathlib, shutil, warnings
+import os, pathlib, shutil, warnings, getpass, warnings
 import numpy as np
 import scipy
 import cv2
@@ -14,7 +14,7 @@ from osgeo import gdal
 
 import ASF
 
-def download(buoy_data, data_dir='data', delta=86400 * 10, offset = 86400*0.1, cred_user=None, cred_pass=None):
+def download(buoy_data, data_dir='data', delta=86400 * 10, offset = 86400*0.1, cred_user=None, cred_pass=None, stage=0):
     '''
     Search and download SLC TOPS burst files overlapping with buoy time-space data from ASF Vertex.
     
@@ -26,51 +26,83 @@ def download(buoy_data, data_dir='data', delta=86400 * 10, offset = 86400*0.1, c
     cred_pass : EarthData or ASF credentials
     '''
     buoy_ids = set(buoy_data.BuoyID)
+    if (cred_user is None or cred_pass is None):
+        cred_user = input('Username:')
+        cred_pass = getpass.getpass('Password:')
     for buoy_id in buoy_ids:
-        buoy_path = data_dir+'/'+str(buoy_id)
+        buoy_path = os.path.join(data_dir,str(buoy_id))
         if not os.path.exists(buoy_path): os.mkdir(buoy_path)
-        scroller = ASF.BuoyScroller(buoy_id, buoy_data)
-        scroller.search(delta=delta, offset=offset)
+        scroller_fn = os.path.join(buoy_path, f'{buoy_id}_BuoyScroller.pickle')
+        if (os.path.exists(scroller_fn)):
+            scroller = ASF.BuoyScroller.from_cache(scroller_fn)
+        else:
+            scroller = ASF.BuoyScroller(buoy_id, buoy_data)
+            scroller.search(delta=delta, offset=offset)
+            scroller.save_cache(scroller_fn)
         scroller.download_results(cache_dir=buoy_path,cred_user=cred_user,cred_pass=cred_pass)
 
-def process_downloads(buoy_data, data_dir='data', idate=3, window=(1024, 128)):
+def process_downloads(buoy_data, data_dir='data', ll_res=(5e-5, 5e-5), window=(256, 256), min_entries=1, overwrite=False, delete_raw=True, idate=3, override_gdal_cache=True):
     '''
     sort sentinel-1 file format {data_dir}/{BUOY_ID}/S1_capID_swath_datetime_... into
     {data_dir}/{BUOY_ID}/{DATETIME}/... format
     '''
+    gdal.UseExceptions()
+    gdal.SetConfigOption('GDAL_NUM_THREADS', 'ALL_CPUS')
+    if (override_gdal_cache): gdal.SetCacheMax(gdal.GetUsablePhysicalRAM() // 4)
     buoy_ids = set(buoy_data.BuoyID)
     for buoy_id in buoy_ids:
         buoy_path = data_dir+'/'+str(buoy_id)
-        fnl = [el for el in os.listdir(buoy_path) if len(el.split('.'))==2] # exclude directories
-        dtl = list(set([el.split('_')[idate] for el in fnl])) + [el for el in os.listdir(buoy_path) if len(el.split('.'))==1]
+        if (not os.path.exists(buoy_path)): continue
+        all_fn_look = os.listdir(buoy_path)
+        if (len([el for el in all_fn_look if os.path.splitext(el)[1] != '.pickle']) < min_entries):
+            shutil.rmtree(buoy_path); continue
+        fnl = [el for el in all_fn_look if (len(el.split('.'))==2 and os.path.splitext(el)[1] != '.pickle')] # exclude directories & .pickle files
+        print(fnl)
+        dtl = list(set([el.split('_')[idate] for el in fnl])) + [el for el in all_fn_look if len(el.split('.'))==1]
         for dtn in dtl:
             print(f'processing: date {dtn} for buoy {buoy_id}')
             dtn_path = buoy_path + '/' + str(dtn)
             if not os.path.exists(dtn_path): os.mkdir(dtn_path)
-            #[os.rename(buoy_path+'/'+fn, dtn_path+'/'+"_".join(fn.split('_')[4:])) for fn in fnl if dtn in fn]
             [os.rename(os.path.join(buoy_path,fn), os.path.join(dtn_path,fn)) for fn in fnl if dtn in fn]
-            merge_gdal(dtn_path, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'])
-            crop_target(os.path.join(dtn_path,'src.tiff'), buoy_data[buoy_data.BuoyID==buoy_id], window)            
+            if (overwrite or (not os.path.exists(os.path.join(dtn_path,'src.tiff')))):
+                merge_gdal(dtn_path, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'])
+            src_fn = os.path.join(dtn_path, 'src.tiff')
+            if (False and os.path.exists(src_fn)):
+                if (overwrite or (not os.path.exists(os.path.join(dtn_path, 'src_grd.tiff')))):
+                    geoproj_op(src_fn, fn_o='src_grd.tiff', ll_res=ll_res)
+                    crop_target_grd(src_fn, buoy_data[buoy_data.BuoyID==buoy_id], window, overwrite=overwrite)
+            if (os.path.exists(os.path.join(dtn_path, 'tgt.tiff'))):
+                clean_dtn(dtn_path, blacklist=('tgt', 'src', 'src_grd'))
+
+def clean_dtn(clean_dir, blacklist):
+    fn_i = [el for el in os.listdir(clean_dir) if os.path.splitext(el)[0] not in blacklist]
+    for fn in fn_i: os.remove(os.path.join(clean_dir, fn))
+
 
 # ---- raster registration & stacking
 
-def merge_gdal(merge_dir, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'], no_warp_precision=1.0, stride=(24,8), batch_factor=16, max_workers=None, override_gdal_cache=True):
+def merge_gdal(merge_dir, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'], no_warp_precision=1.0, stride=(24,8), batch_factor=16, max_workers=None):
     '''merge all .tiff in {merge_dir} into {merge_dir}/src.tiff
     note : master_tags is a list of strings to be located between underscores.
     note2: master files must have an associated .xml file to be recognized as such.'''
-    fn_i = [el for el in os.listdir(merge_dir) if os.path.splitext(el)[1]=='.tiff' and el != fn_o]
+    blacklist = [fn_o, 'target.tiff', 'tgt.tiff', 'src_grd.tiff']
+    fn_i = [el for el in os.listdir(merge_dir) if os.path.splitext(el)[1]=='.tiff' and el not in blacklist]
     imaster = [
         i for i in range(len(fn_i))
-        if bool(set(fn_i[i].split('_')) & set(master_tags)) # any2any match
+        if bool(set(os.path.splitext(fn_i[i])[0].split('_')) & set(master_tags)) # any2any match
         and os.path.exists(os.path.join(merge_dir,os.path.splitext(fn_i[i])[0]+'.xml'))
-    ][0]
+    ]
+    if len(imaster) > 0:
+        imaster = imaster[0]
+    else:
+        print(f'could not merge directory {merge_dir} : no file met master_tag condition. Available files:')
+        [print(fn) for fn in fn_i]
+        return
      # clear existing file
     if (os.path.exists(os.path.join(merge_dir, fn_o))):
         os.remove(os.path.join(merge_dir, fn_o))
     
     # - copy master metadata to src.tiff
-    gdal.UseExceptions()
-    if (override_gdal_cache): gdal.SetCacheMax(gdal.GetUsablePhysicalRAM() // 4)
     ds_i = gdal.Open(os.path.join(merge_dir,fn_i[imaster]))
     iw,ih,irdt,icmp = ds_i.RasterXSize,ds_i.RasterYSize,ds_i.GetRasterBand(1).DataType,ds_i.GetMetadata('IMAGE_STRUCTURE')
     ds_o = gdal.GetDriverByName("MEM").Create('', iw, ih, 1, irdt)
@@ -79,7 +111,8 @@ def merge_gdal(merge_dir, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'], no
     
     # - transfer all bands from source .tiffs to src.tiff
     # primary GCP
-    f1 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY, e.GCPZ/10000) for e in ds_o.GetGCPs()]) # scale Z by 1/10000 for more lat/lon sensitivity
+    #f1 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY, e.GCPZ/10000) for e in ds_o.GetGCPs()]) # scale Z by 1/10000 for more lat/lon sensitivity
+    f1 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY) for e in ds_o.GetGCPs()])
     f1 = scipy.interpolate.RBFInterpolator(f1[:,:2], f1[:,2:]) # line 2 geo
     f1_coords = np.stack(np.meshgrid(np.arange(0,ih+stride[0],stride[0]), np.arange(0,iw+stride[1],stride[1]), indexing='ij'),axis=-1)
     f1_geords = f1(f1_coords.reshape((np.prod(f1_coords.shape[:-1]), f1_coords.shape[-1]))) #N,ngeoparams
@@ -87,7 +120,8 @@ def merge_gdal(merge_dir, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'], no
     band_idx = 1
     for i in range(len(fn_i)):
         ds_i = gdal.Open(os.path.join(merge_dir, fn_i[i]))
-        f2 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY, e.GCPZ/10000) for e in ds_i.GetGCPs()])
+        #f2 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY, e.GCPZ/10000) for e in ds_i.GetGCPs()])
+        f2 = np.array([(e.GCPLine, e.GCPPixel, e.GCPX, e.GCPY) for e in ds_i.GetGCPs()])
         f2 = scipy.interpolate.RBFInterpolator(f2[:,2:], f2[:,:2]) # geo 2 line
         f2_coords = f2(f1_geords).astype(np.float32).reshape(f1_coords.shape)
         displacement = ((f2_coords - f1_coords)**2).sum(axis=-1)
@@ -144,32 +178,108 @@ def _batched_coord_warp(src, dst, pi, pj, crds, strd, bf):
     pc1 = np.stack((pc1,pc2), axis=0)[:, :y1-y0, :x1-x0]
     dst[y0:y1,x0:x1] = scipy.ndimage.map_coordinates(src, pc1, order=0)
 
-# ----- buoy location operation
+# ---- georeferencing stage
 
-def crop_target(src_fn, buoy_data, window=(1024,128)):
+def geoproj_op(src_fn, fn_o='src_grd.tiff', ll_res=(5e-5, 5e-5)):
+    '''
+    geoproject source SLC using GCPs.
+    '''
+    ds_i = gdal.Open(src_fn)
+    wo_ = gdal.SuggestedWarpOutput(ds_i, ["DST_SRS=EPSG:4326"])
+    print(f'GDAL suggested bounds :: iw:{wo_.width} ih:{wo_.height}, xmin:{wo_.xmin}, xmax:{wo_.xmax}, ymin:{wo_.ymin}, ymax:{wo_.ymax}')
+    print(f'.. fixing from resolution x:{(wo_.xmax - wo_.xmin) / wo_.width}, y:{(wo_.ymax - wo_.ymin) / wo_.height} to x:{ll_res[0]}, y:{ll_res[1]}')
+    gdal.Translate(
+        os.path.join(merge_dir, fn_o), ds_o, format='GTiff', bandList=list(range(1,ds_i.RasterCount+1)),
+        creationOptions=[f"{k}={v}" for k,v in ds_i.GetMetadata('IMAGE_STRUCTURE').items() if v is not None],
+        xRes=ll_res[0], yRes=ll_res[1], outputBounds=(wo_.xmin, wo_.ymin, wo_.xmax, wo_.ymax), GCPs=ds_i.GetGCPs()
+    )
+    #ds_o = gdal.Translate( "", ds_i, format="MEM", bandList=list(range(1,ds_i.RasterCount+1)),
+    #                       xRes=5, yRes=, outputBounds=(wo_.xmin, wo_.ymin, wo_.xmax, wo_.ymax), GCPs=ds_i.GetGCPs())
+
+# ----- buoy location slice
+
+def crop_target_grd(src_fn, buoy_data, window=(256,256)):
+    '''identifies and interpolates position of buoys with least time delta and creates slice 'tgt.tiff'.'''
+    if (not os.path.exists(src_fn)):
+        print(f'could not crop source .tiff : path {src_fn} does not exist')
+        return
+    if (isinstance(src_fn, gdal.Dataset)):
+        gdal_data = src_fn
+        src_fn = src_fn.GetDescription()
+    else: gdal_data = gdal.Open(src_fn)
+    by_dt = buoy_data.copy()
+
+    xml_fn = os.path.splitext(src_fn)[0] + '.xml'
+    grid = ET.parse(xml_fn).getroot().find('metadata').find('product').find('content').find('geolocationGrid').find('geolocationGridPointList')
+    slc_dt = datetime.datetime.strptime(pd.DataFrame([{e.tag : e.text for e in el} for el in grid])['azimuthTime'].iloc[0], '%Y-%m-%dT%H:%M:%S.%f')
+
+    by_dt.loc[:,'dt'] = by_dt.apply(
+        lambda x: datetime.datetime(int(x['Year']), int(x['Month']), int(x['Day']),
+                                    int(x['Hour']), int(x['Minute']), int(x['Second'])), axis=1
+    ); by_dt.loc[:,'ddt'] = (by_dt['dt'] - slc_dt).apply(lambda x: x.total_seconds())
+
+     # get up to 12 closest measurements, then order in time axis ; filter for interpolable numeric values
+    closest = by_dt.sort_values(by='ddt', key=(lambda x: abs(x))).iloc[:12].sort_values(by='ddt').select_dtypes(include='number')
+    # convert lon-lat to euclidian coordinates to prevent polar instabilities
+    closest.loc[:,'llx'] = np.cos(np.deg2rad(closest.Lat)) * np.cos(np.deg2rad(closest.Lon))
+    closest.loc[:,'lly'] = np.cos(np.deg2rad(closest.Lat)) * np.sin(np.deg2rad(closest.Lon))
+    closest.loc[:,'llz'] = np.sin(np.deg2rad(closest.Lat))
+    # interpolation
+    ccols = [col for col in closest.columns if col != 'ddt']
+    x, y = closest.ddt.values, np.stack([closest[col].values for col in ccols], axis=-1)
+    if (x.min() * x.max() > 0): warnings.warn(f"{src_fn} image time does not intersect buoy times: fit will be ill-conditioned.")
+    y = scipy.interpolate.PchipInterpolator(x,y)(0)
+    closest = pd.Series(y, index=ccols)
+    # restore lon-lat from normalized euclidian coordinates
+    llnm = (closest['llx']**2 + closest.lly**2 + closest['llz']**2)**0.5
+    closest.loc['Lat'] = np.rad2deg(np.asin(closest['llz']/llnm))
+    closest.loc['Lon'] = np.rad2deg(np.atan2(closest['lly'],closest['llx']))
+
+    # should create new dataset at target location
+    path = pathlib.Path(gdal_data.GetDescription()).parent
+    try:
+        targ_subset = gdal.Translate(destName=os.path.join(path, "tgt.tiff"), srcDS=gdal_data, srcWin=[left,upper,width,height])
+    except:
+        print(f'unable to write file at {os.path.join(path, "tgt.tiff")}')
+
+
+
+
+
+
+
+        
+
+
+# -- OUTDATED : SLC-coordinate target slice
+
+def crop_target_slc(src_fn, buoy_data, window=(1024,128), overwrite=False):
     '''identifies & interpolates position of buoys with least time delta and creates slice 'tgt_{window}.tiff' '''
-    gdal.UseExceptions()
+    if (not os.path.exists(src_fn)):
+        print(f'could not crop source .tiff : path {src_fn} does not exist')
+        return
     gdal_data = gdal.Open(src_fn)
+    by_dt = buoy_data.copy()
 
     # assumes only 1 swath in metadata
     xml_fn = os.path.splitext(src_fn)[0] + '.xml'
     grid = ET.parse(xml_fn).getroot().find('metadata').find('product').find('content').find('geolocationGrid').find('geolocationGridPointList')
     slc_dt = datetime.datetime.strptime(pd.DataFrame([{e.tag : e.text for e in el} for el in grid])['azimuthTime'].iloc[0], '%Y-%m-%dT%H:%M:%S.%f')
     
-    buoy_data['dt'] = buoy_data.apply(
+    by_dt.loc[:,'dt'] = by_dt.apply(
         lambda x: datetime.datetime(int(x['Year']), int(x['Month']), int(x['Day']),
                                     int(x['Hour']), int(x['Minute']), int(x['Second'])),
         axis=1
     )
-    buoy_data['ddt'] = (buoy_data['dt'] - slc_dt).apply(lambda x: x.total_seconds())
+    by_dt.loc[:,'ddt'] = (by_dt['dt'] - slc_dt).apply(lambda x: x.total_seconds())
 
      # get up to 12 closest measurements, then order in time axis ; filter for interpolable numeric values
-    closest = buoy_data.sort_values(by='ddt', key=(lambda x: abs(x))).iloc[:12].sort_values(by='ddt').select_dtypes(include='number')
+    closest = by_dt.sort_values(by='ddt', key=(lambda x: abs(x))).iloc[:12].sort_values(by='ddt').select_dtypes(include='number')
     
     # convert lon-lat to euclidian coordinates to prevent polar instabilities
-    closest['llx'] = np.cos(np.deg2rad(closest.Lat)) * np.cos(np.deg2rad(closest.Lon))
-    closest['lly'] = np.cos(np.deg2rad(closest.Lat)) * np.sin(np.deg2rad(closest.Lon))
-    closest['llz'] = np.sin(np.deg2rad(closest.Lat))
+    closest.loc[:,'llx'] = np.cos(np.deg2rad(closest.Lat)) * np.cos(np.deg2rad(closest.Lon))
+    closest.loc[:,'lly'] = np.cos(np.deg2rad(closest.Lat)) * np.sin(np.deg2rad(closest.Lon))
+    closest.loc[:,'llz'] = np.sin(np.deg2rad(closest.Lat))
 
     # interpolation
     ccols = [col for col in closest.columns if col != 'ddt']
@@ -180,19 +290,22 @@ def crop_target(src_fn, buoy_data, window=(1024,128)):
 
     # restore lon-lat from normalized euclidian coordinates
     llnm = (closest['llx']**2 + closest.lly**2 + closest['llz']**2)**0.5
-    closest['Lat'] = np.rad2deg(np.asin(closest['llz']/llnm))
-    closest['Lon'] = np.rad2deg(np.atan2(closest['lly'],closest['llx']))
+    closest.loc['Lat'] = np.rad2deg(np.asin(closest['llz']/llnm))
+    closest.loc['Lon'] = np.rad2deg(np.atan2(closest['lly'],closest['llx']))
 
     ll2px_worker = ll2px_function(gdal_data)
-    _paint_target(gdal_data, lat=closest['Lat'], lon=closest['Lon'], window=window, ll2px_worker=ll2px_worker)
+    if (not overwrite and os.path.exists(os.path.join(os.path.dirname(src_fn),"target.tiff"))):
+        print ('dataset already has target.tiff; skipping operation')
+        return
+        
+    _paint_target_slc(gdal_data, lat=closest['Lat'], lon=closest['Lon'], window=window, ll2px_worker=ll2px_worker, overwrite=overwrite)
 
 def ll2px_function(dataset):
     
     points = np.array([[gcp.GCPLine, gcp.GCPPixel, gcp.GCPY, gcp.GCPX] for gcp in dataset.GetGCPs()])
     return scipy.interpolate.RBFInterpolator(points[:,2:],points[:,:2])
 
-def _paint_target(dataset, lat, lon, ll2px_worker=None, window=(1024, 128), add_mask=False, overwrite=True):
-    
+def _paint_target_slc(dataset, lat, lon, ll2px_worker=None, window=(1024, 128), add_mask=False, overwrite=False):
     if (dataset.RasterCount == 1):
         print('dataset only has one band; data processing may be incomplete')
         #raise ValueError('This dataset contains no bonus data! Choose a processed data .tiff.')
@@ -217,13 +330,15 @@ def _paint_target(dataset, lat, lon, ll2px_worker=None, window=(1024, 128), add_
     # src : https://gdal.org/en/stable/api/python/utilities.html#osgeo.gdal.TranslateOptions
     upper= max(0,tg_i - window[0]//2)
     left = max(0,tg_j - window[1]//2)
-    width  = min(window[0], dataset.RasterXSize - left)
-    height = min(window[1], dataset.RasterYSize - upper)
+    width  = max(min(window[0], dataset.RasterXSize - left), 0)
+    height = max(min(window[1], dataset.RasterYSize - upper), 0)
     print (f'creating window of (left,width,upper,height) ({left} {width}, {upper} {height}) for raster of shape ({dataset.RasterXSize},{dataset.RasterYSize})')
     path = pathlib.Path(dataset.GetDescription()).parent
     # should create new dataset at target location
-    if (not overwrite and os.path.exists(f"{path}/target.tiff")):
+    if (not overwrite and os.path.exists(os.path.join(path, "target.tiff"))):
         raise ValueError('target file already exists! Suspending operation.')
-    #targ_subset = gdal.Translate(destName=f"{path}/target.tiff", srcDS=dataset, srcWin=[left,upper,window[1],window[0]])
-    targ_subset = gdal.Translate(destName=f"{path}/target.tiff", srcDS=dataset, srcWin=[left,upper,width,height])
+    try:
+        targ_subset = gdal.Translate(destName=os.path.join(path, "target.tiff"), srcDS=dataset, srcWin=[left,upper,width,height])
+    except:
+        return
     # targ_subset = None

@@ -1,3 +1,86 @@
+
+def planarproj_op(src_fn, fn_o='src_pln.tiff', yx_res=(3.0,3.0), gcp_count=2000):
+    ds_i = gdal.Open(src_fn)
+    dirpath = pathlib.Path(ds_i.GetDescription()).parent
+
+    transformer = gdal.Transformer(ds_i, None, ["METHOD=GCP_TPS"])
+    success, (cen_lon, cen_lat, _) = transformer.TransformPoint(False, ds_i.RasterXSize/2,  ds_i.RasterYSize / 2)
+    if (not success): raise ValueError('GCP_TPS method failed to retrieve values.')
+    dst_srs = osr.SpatialReference()
+    #
+    #  DOES NOT WORK : GDAL DOES NOT HAVE INVERTIBLE PROPERTY FOR TOPOCENTRIC PROJECTION
+    #
+    dst_srs.ImportFromProj4(f'+proj=topocentric +ellps=WGS84 +lon_0={cen_lon} +lat_0={cen_lat} +h_0={0}')
+    
+    ds_o = gdal.Warp(
+        os.path.join(dirpath, fn_o), ds_i, dstSRS=dst_srs, xRes=yx_res[1], yRes=yx_res[0],
+        outputBounds=None, targetAlignedPixels=True, resampleAlg='bilinear', transformerOptions=['METHOD=GCP_TPS'],
+        creationOptions=[f"{k}={v}" for k,v in ds_i.GetMetadata('IMAGE_STRUCTURE').items() if v is not None]
+    )
+    dst_srs, llz_srs = osr.SpatialReference(ds_o.GetProjection()), osr.SpatialReference(epsg=4326)
+    ct, gt = osr.CoordinateTransformation(dst_srs, llz_srs), ds_o.GetGeoTransform()
+    gcps, spacing = [], ((ds_o.RasterYSize*yx_res[0]*ds_o.RasterXSize*yx_res[1])/gcp_count)**0.5
+    for i in range(0, ds_o.RasterYSize, int(spacing/yx_res[0])):
+        for j in range(0, ds_o.RasterXSize, int(spacing/yx_res[1])):
+            x, y = gt[0] + j*gt[1] + i*gt[2], gt[3] + j*gt[4] + i*gt[5] # pixel → projected coordinates
+            lon, lat, z = ct.TransformPoint(x, y) # projected → lat/lon
+            gcps.append(gdal.GCP(lon, lat, z, j, i))
+    ds_o.SetGCPs(gcps, llz_srs.ExportToWkt())
+
+# ----- buoy location slice
+
+def crop_target_pln(src_fn, fn_o, buoy_data, window=(64,64), yx_res=(3.0,3.0)):
+    '''identifies and interpolates position of buoys with least time delta and creates slice 'tgt.tiff'.'''
+    if (not os.path.exists(src_fn)):
+        print(f'could not crop source .tiff : path {src_fn} does not exist'); return
+    if (isinstance(src_fn, gdal.Dataset)):
+        gdal_data = src_fn; src_fn = src_fn.GetDescription()
+    else: gdal_data = gdal.Open(src_fn)
+
+    xml_fn  = os.path.splitext(src_fn)[0] + '.xml'
+    closest = buoy_loc(xml_fn, buoy_data)
+    ct = osr.CoordinateTransformation(osr.SpatialReference(epsg=4326), osr.SpatialReference(gdal_data.GetProjection()))
+    x, y = ct.TransformPoint(closest.Lon, closest.Lat)
+    ymin, ymax = y - yx_res[0]*window[0]/2, y + yx_res[0]*window[0]/2
+    xmin, xmax = x - yx_res[1]*window[1]/2, x + yx_res[1]*window[1]/2
+    
+    path = pathlib.Path(gdal_data.GetDescription()).parent
+    closest.to_json(os.path.join(path, os.path.splitext(fn_o)[0] + '.json')) #save buoy location
+    try: # projWin : subwindow in projected coordinates to extract: [ulx, uly, lrx, lry]
+        gdal.Translate(os.path.join(path, fn_o), gdal_data, width=window[1], height=window[0], projWin=[xmin,ymax,xmax,ymin], resampleAlg='nearest')
+    except: print(f'GDAL failed to write file to {fn_o}')
+
+def buoy_loc(slc_xml_fn, buoy_data, xml_srs=None):
+    if (xml_srs is None): xml_srs = osr.SpatialReference(epsg=4326)
+    grid = ET.parse(slc_xml_fn).getroot().find('metadata').find('product').find('content').find('geolocationGrid').find('geolocationGridPointList')
+    slc_dt = datetime.datetime.strptime(pd.DataFrame([{e.tag : e.text for e in el} for el in grid])['azimuthTime'].iloc[0], '%Y-%m-%dT%H:%M:%S.%f')
+    by_dt = buoy_data.copy()
+    by_dt.loc[:,'dt'] = by_dt.apply(lambda x: datetime.datetime(
+        int(x['Year']), int(x['Month']), int(x['Day']),
+        int(x['Hour']), int(x['Minute']), int(x['Second'])
+    ), axis=1)
+    by_dt.loc[:,'ddt'] = (by_dt['dt'] - slc_dt).apply(lambda x: x.total_seconds())
+    
+    # get up to 12 closest measurements, then order in time axis ; filter for interpolable numeric values
+    # +: convert lon-lat to euclidian coordinates to prevent polar instabilities
+    closest = by_dt.sort_values(by='ddt', key=(lambda x: abs(x))).iloc[:12].sort_values(by='ddt').select_dtypes(include='number')
+    closest.loc[:,'llx'], closest.loc[:,'lly'], closest.loc[:,'llz'] = srs_llh2xyz(xml_srs, closest.loc[:,'Lat'], closest.loc[:,'Lon'])
+
+    # interpolation
+    ccols = [col for col in closest.columns if col != 'ddt']
+    x, y = closest.ddt.values, np.stack([closest[col].values for col in ccols], axis=-1)
+    if (x.min() * x.max() > 0): warnings.warn(f"{src_fn_xml} image time does not intersect buoy times: fit will be ill-conditioned.")
+    y = scipy.interpolate.PchipInterpolator(x,y)(0)
+    closest = pd.Series(y, index=ccols)
+
+    xyz = np.array([closest.loc['llx'], closest.loc['lly'], closest.loc['llz']]); xyz /= np.linalg.norm(xyz) / xml_srs.GetSemiMajor()
+    closest.loc['Lat'], closest.loc['Lon'], _ = srs_xyz2llh(xml_srs, *xyz)
+    return closest
+
+
+
+
+
 class BuoyScroller_PointSearcher:
     
     def __init__(self, buoy_id, buoy_data, query_retries=5):

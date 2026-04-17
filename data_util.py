@@ -80,6 +80,29 @@ def clean_dtn(clean_dir, blacklist):
     fn_i = [el for el in os.listdir(clean_dir) if os.path.splitext(el)[0] not in blacklist]
     for fn in fn_i: os.remove(os.path.join(clean_dir, fn))
 
+# debug inspector
+def debug_inspect(buoy_dir='/mnt/d/data_IceTracker_2020m1/174640', check=('coords')):
+    for i in range(len(os.listdir(buoy_dir))):
+        if ('.pickle' in os.listdir(buoy_dir)[i]): continue
+        #path = os.path.join(buoy_dir, os.listdir(buoy_dir)[i], 'tgt_pln.tiff')
+        #ds_i = gdal.Open(path)
+        #ds_i = ds_i.GetRasterBand(1).ReadAsArray()
+        #plt.imshow((np.abs(ds_i)), cmap='grey'); plt.show()
+        #print(len(ds_i.GetGCPs()))
+
+        if ('coords' in inspect):
+            ds_i = gdal.Open(os.path.join(buoy_dir, os.listdir(buoy_dir)[i], 'src_pln.tiff'))
+            srs = osr.SpatialReference(ds_i.GetGCPProjection())
+            f1 = np.array([[e.GCPLine,e.GCPPixel]+list(srs_llh2xyz(srs, e.GCPY, e.GCPX, e.GCPZ)) for e in ds_i.GetGCPs()])
+            f1 = scipy.interpolate.RBFInterpolator(f1[:,:2], f1[:,2:])
+            tmp = np.stack(np.meshgrid(np.arange(0,ds_i.RasterYSize,10),np.arange(0,ds_i.RasterXSize),indexing='ij'),axis=-1)
+            ds_i = f1(tmp.reshape((-1,2))).reshape((tmp.shape[0],tmp.shape[1],3))
+            ds_i = srs_xyz2llh(srs, ds_i[...,0], ds_i[...,1], ds_i[...,2])
+            plt.imshow(ds_i[0]); plt.title('latitude'); plt.colorbar(shrink=0.15); plt.show()
+            plt.imshow(ds_i[1]); plt.title('longitude'); plt.colorbar(shrink=0.15); plt.show()
+            plt.imshow(ds_i[2]); plt.title('altitude'); plt.colorbar(shrink=0.15); plt.show()
+        print('next')
+
 
 # ---- raster registration & stacking
 

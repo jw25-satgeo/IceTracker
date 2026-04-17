@@ -41,7 +41,7 @@ def download(buoy_data, data_dir='data', delta=86400 * 10, offset = 86400*0.1, c
             scroller.save_cache(scroller_fn)
         scroller.download_results(cache_dir=buoy_path,cred_user=cred_user,cred_pass=cred_pass)
 
-def process_downloads(buoy_data, data_dir='data', yx_res=(3.0, 3.0), window=(128, 128), min_entries=1, overwrite=False, delete_raw=True, idate=3, override_gdal_cache=True):
+def process_downloads(buoy_data, data_dir='data', stages=(0,1,2), yx_res=(3.0, 3.0), window=(128, 128), min_entries=1, overwrite=False, delete_raw=True, idate=3, override_gdal_cache=True):
     '''
     sort sentinel-1 file format {data_dir}/{BUOY_ID}/S1_capID_swath_datetime_... into
     {data_dir}/{BUOY_ID}/{DATETIME}/... format
@@ -64,13 +64,13 @@ def process_downloads(buoy_data, data_dir='data', yx_res=(3.0, 3.0), window=(128
             dtn_path = buoy_path + '/' + str(dtn)
             if not os.path.exists(dtn_path): os.mkdir(dtn_path)
             [os.rename(os.path.join(buoy_path,fn), os.path.join(dtn_path,fn)) for fn in fnl if dtn in fn]
-            if (overwrite or (not os.path.exists(os.path.join(dtn_path,'src.tiff')))):
+            if ((0 in stages) and (overwrite or (not os.path.exists(os.path.join(dtn_path,'src.tiff'))))):
                 merge_gdal(dtn_path, fn_o='src.tiff', master_tags=['HH','HV','VH','VV'])
             src_fn = os.path.join(dtn_path, 'src.tiff')
             if (os.path.exists(src_fn)):
-                if (overwrite or (not os.path.exists(os.path.join(dtn_path, 'src_pln.tiff')))):
+                if ((1 in stages) and (overwrite or (not os.path.exists(os.path.join(dtn_path, 'src_pln.tiff'))))):
                     planarproj_op(src_fn, 'src_pln.tiff', yx_res=yx_res, gcp_count=2000)
-                if (overwrite or (not os.path.exists(os.path.join(dtn_path, 'tgt_pln.tiff')))):
+                if ((2 in stages) and (overwrite or (not os.path.exists(os.path.join(dtn_path, 'tgt_pln.tiff'))))):
                     crop_target_pln(src_fn, 'tgt_pln.tiff', buoy_data[buoy_data.BuoyID==buoy_id], window)
             else: print(f'skipping secondary operation : no source file located at {src_fn}.')
             if (os.path.exists(os.path.join(dtn_path, 'tgt.tiff'))):
@@ -218,10 +218,12 @@ def planarproj_op(src_fn, fn_o='src_pln.tiff', yx_res=(3.0,3.0), gcp_count=2000,
     bord = np.stack(np.meshgrid(np.arange(ds_i.RasterYSize), np.arange(ds_i.RasterXSize), indexing='ij'), axis=-1)
     bord[1:-1,1:-1] = -1; bord = bord[(bord > -1).any(axis=-1)]; bord = f1(bord) # mask flattens dims 1,2 to boundary coordinates
     c_pos = f1(np.array([ds_i.RasterYSize/2, ds_i.RasterXSize/2])[None,:])[0] # center pixel to center [1,3]
+    
     # tangent-plane north & east vectors
     n_e = max((np.cross([0,0,1], c_pos), np.cross([1,0,0], c_pos)), key=lambda v: np.linalg.norm(v));
     n_n = np.cross(c_pos, n_e);
     n_n, n_e = n_n/np.linalg.norm(n_n), n_e/np.linalg.norm(n_e)
+    
     # find maximal vertical and horizontal distances
     n_n_d = np.sum((bord - c_pos[None,:]) * n_n[None,:], axis=-1) # dot product
     n_e_d = np.sum((bord - c_pos[None,:]) * n_e[None,:], axis=-1)
@@ -231,27 +233,36 @@ def planarproj_op(src_fn, fn_o='src_pln.tiff', yx_res=(3.0,3.0), gcp_count=2000,
     
     srs4326 = osr.SpatialReference(epsg=4326)
     a = srs4326.GetSemiMajor(); b = a*(1 - 1/srs4326.GetInvFlattening())
-    ds_o = gdal.GetDriverByName("MEM").Create('', ds_y_n, ds_x_n, ds_i.RasterCount, ds_i.GetRasterBand(1).DataType)
-    
+    ds_o = gdal.GetDriverByName("MEM").Create('', ysize=ds_y_n, xsize=ds_x_n, bands=ds_i.RasterCount, eType=ds_i.GetRasterBand(1).DataType)
+
+    # generate coordinate grid
     crd_o = np.stack(np.meshgrid( # linspace spanning pixel center locations on coarse grid
         np.linspace(n_n_min + 0.5*(n_n_max-n_n_min)/ds_y_n, n_n_max - 0.5*(n_n_max-n_n_min)/ds_y_n, ds_y_n//crd_coarse),
         np.linspace(n_e_min + 0.5*(n_e_max-n_e_min)/ds_x_n, n_e_max - 0.5*(n_e_max-n_e_min)/ds_x_n, ds_x_n//crd_coarse), indexing='ij'
     ),axis=-1)
     crd_o = crd_o[...,0,None]*n_n[None,None,:] + crd_o[...,1,None]*n_e[None,None,:] + c_pos[None,None,:]  # n,e ->  xyz-coordinates in tangent plane
     crd_o /= ((crd_o**2 / np.array([a, a, b])[None,None,:]**2).sum(axis=-1)**0.5)[...,None] # deform tangent plane to WGS84 ellipsoid surface
+    
     # save function map from output dataset pixel coordinates to xyz euclidian
     f3 = scipy.interpolate.RegularGridInterpolator((np.linspace(0,ds_y_n-1,crd_o.shape[0]),np.linspace(0,ds_x_n-1,crd_o.shape[1])), crd_o, bounds_error=False)
+
+    # map xyz coordinates to source image pixel space
     crd_o = f2(crd_o.reshape((-1,3))).reshape((crd_o.shape[0],crd_o.shape[1],2)) # source image pixel coordinates
-    crd_o = np.swapaxes(np.stack([cv2.resize(crd_o[...,i], (ds_x_n, ds_y_n)) for i in range(crd_o.shape[-1])], axis=0), 1, 2)
+    crd_o = np.stack([cv2.resize(crd_o[...,i], (ds_x_n, ds_y_n)) for i in range(crd_o.shape[-1])], axis=0)
+    occ = np.ones((ds_o.RasterYSize, ds_o.RasterXSize), dtype=np.uint8)
     for i in range(1, ds_i.RasterCount + 1):
-        b_i = ds_i.GetRasterBand(i).ReadAsArray()
-        ds_o.GetRasterBand(i).WriteArray(scipy.ndimage.map_coordinates(b_i, crd_o))
-        
+        band = scipy.ndimage.map_coordinates(ds_i.GetRasterBand(i).ReadAsArray(), crd_o)
+        occ[band == 0] = 0  # map_coordinates sets cval or 0 out of bounds
+        ds_o.GetRasterBand(i).WriteArray(band)
+
+    # generate new GCP grid for lat-lon georeference capability
     spc = ((ds_o.RasterYSize*yx_res[0]*ds_o.RasterXSize*yx_res[1])/gcp_count)**0.5
     gcpi = np.stack(np.meshgrid(
         np.arange(0,ds_o.RasterYSize,int(spc/yx_res[0])),
         np.arange(0,ds_o.RasterXSize,int(spc/yx_res[1])),indexing='ij'
-    ),axis=-1).reshape(-1,2).astype(float)
+    ),axis=-1).astype(float)
+    occ = cv2.resize(occ,(gcpi.shape[1],gcpi.shape[0]),interpolation=cv2.INTER_NEAREST).astype(bool)
+    gcpi = gcpi[occ]
     f3 = f3(gcpi)
     gcps = srs_xyz2llh(srs4326, *[f3[:,i] for i in range(3)])
     gcps = [gdal.GCP(gcps[1][i], gcps[0][i], gcps[2][i], gcpi[i,1], gcpi[i,0]) for i in range(len(gcps))]
@@ -272,13 +283,13 @@ def crop_target_pln(src_fn, fn_o, buoy_data, window=(64,64)):
     else: gdal_data = gdal.Open(src_fn)
 
     xml_fn  = os.path.splitext(src_fn)[0] + '.xml'
-    closest = buoy_loc(xml_fn, buoy_data)
+    by_pt, closest = buoy_loc(xml_fn, buoy_data)
     ds_gcp = np.array([[gcp.GCPLine, gcp.GCPPixel, gcp.GCPY, gcp.GCPX] for gcp in gdal_data.GetGCPs()])
-    y, x = scipy.interpolate.RBFInterpolator(ds_gcp[:,2:],ds_gcp[:,:2])([[closest.Lat, closest.Lon]])[0]
+    y, x = scipy.interpolate.RBFInterpolator(ds_gcp[:,2:],ds_gcp[:,:2])([[by_pt.Lat, by_pt.Lon]])[0]
     ymin, xmin = int(round(y - window[0]/2)), int(round(x - window[1]/2))
     print (f'attempting crop at location (y, x) ({y} {x}) for raster of shape (y:{gdal_data.RasterYSize},x:{gdal_data.RasterXSize})')
     path = pathlib.Path(gdal_data.GetDescription()).parent
-    closest.to_json(os.path.join(path, os.path.splitext(fn_o)[0] + '.json')) #save buoy location
+    pd.concat((pd.DataFrame(by_pt).T, closest)).to_json(os.path.join(path, os.path.splitext(fn_o)[0] + '.json')) #save buoy location
     try: # projWin : subwindow in projected coordinates to extract: [ulx, uly, lrx, lry]
         gdal.Translate(os.path.join(path, fn_o), gdal_data, srcWin=[xmin,ymin,window[1],window[0]], resampleAlg='nearest')
     except: print(f'GDAL failed to write file to {fn_o}')
@@ -304,11 +315,11 @@ def buoy_loc(slc_xml_fn, buoy_data, xml_srs=None):
     x, y = closest.ddt.values, np.stack([closest[col].values for col in ccols], axis=-1)
     if (x.min() * x.max() > 0): warnings.warn(f"{src_fn_xml} image time does not intersect buoy times: fit will be ill-conditioned.")
     y = scipy.interpolate.PchipInterpolator(x,y)(0)
-    closest = pd.Series(y, index=ccols)
+    interp = pd.Series(y, index=ccols)
 
-    xyz = np.array([closest.loc['llx'], closest.loc['lly'], closest.loc['llz']]); xyz /= np.linalg.norm(xyz) / xml_srs.GetSemiMajor()
-    closest.loc['Lat'], closest.loc['Lon'], _ = srs_xyz2llh(xml_srs, *xyz)
-    return closest
+    xyz = np.array([interp.loc['llx'], interp.loc['lly'], interp.loc['llz']]); xyz /= (np.linalg.norm(xyz) / xml_srs.GetSemiMajor())
+    interp.loc['Lat'], interp.loc['Lon'], _ = srs_xyz2llh(xml_srs, *xyz)
+    return interp, closest
 
 
     
@@ -362,7 +373,7 @@ def crop_target_grd(src_fn, fn_o, buoy_data, window=(256,256), ll_res=(5e-5, 5e-
     by_dt = buoy_data.copy()
 
     xml_fn = os.path.splitext(src_fn)[0] + '.xml'
-    closest = buoy_loc(xml_fn, buoy_data)
+    closest, _ = buoy_loc(xml_fn, buoy_data)
 
     # should create new dataset at target location
     lon_correction_factor = 1.0
@@ -392,7 +403,7 @@ def crop_target_slc(src_fn, buoy_data, window=(1024,128), overwrite=False):
     gdal_data = gdal.Open(src_fn)
     by_dt = buoy_data.copy()
     xml_fn = os.path.splitext(src_fn)[0] + '.xml'
-    closest = buoy_loc(xml_fn, buoy_data)
+    closest, _ = buoy_loc(xml_fn, buoy_data)
     ll2px_worker = ll2px_function(gdal_data)
     if (not overwrite and os.path.exists(os.path.join(os.path.dirname(src_fn),"target.tiff"))):
         print ('dataset already has target.tiff; skipping operation')

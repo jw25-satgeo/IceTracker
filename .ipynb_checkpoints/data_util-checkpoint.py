@@ -41,7 +41,7 @@ def download(buoy_data, data_dir='data', delta=86400 * 10, offset = 86400*0.1, c
             scroller.save_cache(scroller_fn)
         scroller.download_results(cache_dir=buoy_path,cred_user=cred_user,cred_pass=cred_pass)
 
-def process_downloads(buoy_data, data_dir='data', stages=(0,1,2), yx_res=(3.0, 3.0), window=(128, 128), min_entries=1, overwrite=False, delete_raw=True, idate=3, override_gdal_cache=True):
+def process_downloads(buoy_data, data_dir='data', stages=(0,1,2), yx_res=(3.0, 3.0), window=(128, 128), min_entries=1, overwrite=False, delete_raw=True, idate=3, override_gdal_cache=True, clean_blacklist=['tgt','tgt_pln','src','src_pln']):
     '''
     sort sentinel-1 file format {data_dir}/{BUOY_ID}/S1_capID_swath_datetime_... into
     {data_dir}/{BUOY_ID}/{DATETIME}/... format
@@ -73,11 +73,12 @@ def process_downloads(buoy_data, data_dir='data', stages=(0,1,2), yx_res=(3.0, 3
                 if ((2 in stages) and (overwrite or (not os.path.exists(os.path.join(dtn_path, 'tgt_pln.tiff'))))):
                     crop_target_pln(src_fn, 'tgt_pln.tiff', buoy_data[buoy_data.BuoyID==buoy_id], window)
             else: print(f'skipping secondary operation : no source file located at {src_fn}.')
-            if (os.path.exists(os.path.join(dtn_path, 'tgt.tiff'))):
-                clean_dtn(dtn_path, blacklist=('tgt','tgt_grd','tgt_pln','src','src_grd','src_pln'))
+            #if (os.path.exists(os.path.join(dtn_path, 'tgt.tiff'))):
+            clean_dtn(dtn_path, blacklist=clean_blacklist, ignore_xml=True)
 
-def clean_dtn(clean_dir, blacklist):
+def clean_dtn(clean_dir, blacklist, ignore_xml=True):
     fn_i = [el for el in os.listdir(clean_dir) if os.path.splitext(el)[0] not in blacklist]
+    if (ignore_xml): fn_i = [el for el in fn_i if os.path.splitext(el)[1] != '.xml']
     for fn in fn_i: os.remove(os.path.join(clean_dir, fn))
 
 # debug inspector
